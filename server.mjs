@@ -1,4 +1,4 @@
-// server.mjs – Raum-Server für den Online-Modus
+// server.mjs – Raum-Server für den Online-Modus (mit CPU-Plätzen)
 // Lokal starten: npm start (Port 8080)
 // Auf dem Hosting-Dienst gibt der Dienst den Port über PORT vor.
 import { WebSocketServer, WebSocket } from 'ws';
@@ -24,24 +24,39 @@ function createRoomCode() {
 }
 
 function sendTo(ws, message) {
-    if (ws.readyState === WebSocket.OPEN) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(message));
     }
 }
 
+// Plätze mit Verbindung (Menschen). CPU-Plätze haben keine Verbindung.
+function humanSlots(room) {
+    return [...room.players]
+        .filter(([, player]) => !player.cpu)
+        .map(([slot]) => slot);
+}
+
+// Der Host ist der Mensch mit dem kleinsten Platz. Er führt auch die CPU-Züge aus.
+function hostOf(room) {
+    return Math.min(...humanSlots(room));
+}
+
 function sendToRoom(room, message, exceptSlot = -1) {
     for (const [slot, player] of room.players) {
-        if (slot !== exceptSlot) sendTo(player.ws, message);
+        if (slot !== exceptSlot && !player.cpu) {
+            sendTo(player.ws, message);
+        }
     }
 }
 
 function lobbyMessage(room) {
     return {
         type: 'lobby',
-        hostSlot: Math.min(...room.players.keys()),
+        hostSlot: hostOf(room),
         players: [...room.players].map(([slot, player]) => ({
             slot,
-            figure: player.figure
+            figure: player.figure,
+            cpu: player.cpu === true
         }))
     };
 }
@@ -72,7 +87,7 @@ wss.on('connection', ws => {
                 rooms.set(code, room);
 
                 slot = 0;
-                room.players.set(slot, { ws, figure: 0 });
+                room.players.set(slot, { ws, figure: 0, cpu: false });
 
                 console.log(`Raum ${code} erstellt`);
 
@@ -104,7 +119,7 @@ wss.on('connection', ws => {
 
                 room = target;
                 slot = [0, 1, 2, 3].find(s => !room.players.has(s));
-                room.players.set(slot, { ws, figure: 0 });
+                room.players.set(slot, { ws, figure: 0, cpu: false });
 
                 sendTo(ws, { type: 'joined', code, slot });
                 sendToRoom(room, lobbyMessage(room));
@@ -117,8 +132,37 @@ wss.on('connection', ws => {
                 const player = room.players.get(slot);
                 const figure = Number(msg.figure);
 
-                if (player && Number.isInteger(figure) && figure >= 0 && figure <= 3) {
+                if (player && !player.cpu && Number.isInteger(figure) && figure >= 0 && figure <= 3) {
                     player.figure = figure;
+                    sendToRoom(room, lobbyMessage(room));
+                }
+                break;
+            }
+
+            // Nur der Host kann CPU-Plätze hinzufügen und entfernen
+            case 'addCpu': {
+                if (!room || room.started || slot !== hostOf(room)) break;
+
+                const free = [0, 1, 2, 3].find(s => !room.players.has(s));
+
+                if (free === undefined) {
+                    sendTo(ws, { type: 'error', message: 'Es können maximal vier Spieler teilnehmen.' });
+                    break;
+                }
+
+                room.players.set(free, { ws: null, figure: 0, cpu: true });
+                sendToRoom(room, lobbyMessage(room));
+                break;
+            }
+
+            case 'removeCpu': {
+                if (!room || room.started || slot !== hostOf(room)) break;
+
+                const cpuSlot = Number(msg.slot);
+                const target = room.players.get(cpuSlot);
+
+                if (target && target.cpu) {
+                    room.players.delete(cpuSlot);
                     sendToRoom(room, lobbyMessage(room));
                 }
                 break;
@@ -127,7 +171,7 @@ wss.on('connection', ws => {
             case 'start': {
                 if (!room || room.started) break;
 
-                if (slot !== Math.min(...room.players.keys())) {
+                if (slot !== hostOf(room)) {
                     sendTo(ws, { type: 'error', message: 'Nur der Host kann das Spiel starten.' });
                     break;
                 }
@@ -145,7 +189,7 @@ wss.on('connection', ws => {
             case 'game': {
                 if (!room || !room.started) break;
 
-                // Spielnachrichten werden unverändert an die anderen weitergeleitet
+                // Spielnachrichten werden unverändert an die anderen Menschen weitergeleitet
                 sendToRoom(room, { type: 'game', data: msg.data }, slot);
                 break;
             }
@@ -158,13 +202,14 @@ wss.on('connection', ws => {
 
         room.players.delete(slot);
 
-        if (room.players.size === 0) {
+        // Ohne Menschen im Raum steuert niemand das Spiel: der Raum wird geschlossen
+        if (humanSlots(room).length === 0) {
             rooms.delete(room.code);
             return;
         }
 
         if (room.started) {
-            sendToRoom(room, { type: 'playerLeft', slot });
+            sendToRoom(room, { type: 'playerLeft', slot, hostSlot: hostOf(room) });
         } else {
             sendToRoom(room, lobbyMessage(room));
         }
